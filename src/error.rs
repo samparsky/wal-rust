@@ -1,12 +1,15 @@
 use std::fmt;
+use std::io;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Error {
     Corrupt,
     Closed,
     NotFound,
     OutofOrder,
     OutOfRange,
+    InMemoryLog,
+    File(std::io::Error)
 }
 
 impl std::error::Error for Error {}
@@ -19,6 +22,14 @@ impl fmt::Display for Error {
             Error::NotFound => write!(f, "not found"),
             Error::OutofOrder => write!(f, "out of order"),
             Error::OutOfRange => write!(f, "out of range"),
+            Error::InMemoryLog => write!(f, "in-memory log not supported"),
+            Error::File(e) => write!(f, "file: {}", e),
         }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Error::File(error)
     }
 }
