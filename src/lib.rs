@@ -24,6 +24,10 @@ lazy_static! {
     pub static ref MAX_READERS: usize = 8; 
 }
 
+/**
+ * improvements allow fixed size data / data of arbitrary length
+ */
+
 #[derive(Debug)]
 pub struct Log<'a> {
     pub path: PathBuf,
@@ -468,8 +472,8 @@ impl<'a> Log<'a> {
     }
 
     fn find_segment(&self, index: u64) -> u64 {
-        let i: u64 = 0;
-        let j = self.segments.len() as u64;
+        let mut i: u64 = 0;
+        let mut j = self.segments.len() as u64;
 
         while i < j {
             let h = i + (j - i) / 2;
@@ -540,13 +544,162 @@ impl<'a> Log<'a> {
         }
     }
 
-    pub fn truncate_back(last_index: u64) -> Result<(), Error>{
+    pub fn truncate_back(&mut self, last_index: u64) -> Result<(), Error>{
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        let index = last_index;
 
+        if index == 0 || self.last_index == 0 || index > self.last_index || index < self.first_index {
+            return Err(Error::OutOfRange);
+        }
+
+        if self.buffer.len() > 0 {
+            self.file.write_all(&self.buffer).expect("should write to file");
+            self.buffer = Vec::new();
+        }
+
+        // close all readers
+        // TODO check do I need readers array???
+
+        if index == self.last_index {
+            return Ok(())
+        }
+
+        let sindex = self.find_segment(index);
+
+        // Open file
+        let file = File::open(&self.segments[sindex as usize].path)?;
+
+        // Read all entries prior to entry at index
+        let mut reader = BufReader::new(&file);
+        let mut found = false;
+        // let mut offset = 0;
+        loop {
+            let ridx = self.read_entry(&mut reader)?;
+            if ridx.index == index {
+                // offset = reader.buffer().len();
+                // offset = file.seek(SeekFrom::Start(file_size))?;
+                found = true;
+                break;
+
+            }
+
+        }
+
+        if !found {
+            return Err(Error::Corrupt);
+        }
+
+        // create a temp file in the log dir & copy all of data
+        // up to offset
+
+        let temp_filepath = self.path.join("TEMP");
+        let mut temp_file = File::create(&temp_filepath)?;
+
+        // copy read data into temp file
+        std::io::copy(&mut reader, &mut temp_file)?;
+
+        drop(temp_file); // close temp_file
+        drop(file); // close file
+
+        // rename the temp file to end file
+        let end_filename = self.segments[sindex as usize].path.clone();
+
+        for i in (0..self.segments.len()).rev() {
+            if i < sindex as usize { break; }
+            fs::remove_file(&self.segments[i].path).expect("should remove file");
+        }
+
+        self.segments.truncate((sindex + 1) as usize);
+        fs::rename(&temp_filepath, &end_filename)?;
+
+        self.file = OpenOptions::new().read(true).write(true).open(end_filename.clone())?;
+        let file_size = self.file.metadata()?.len();
+        self.file_size = file_size as usize;
+        self.buffer = Vec::new();
+        self.last_index = index;
+
+        // move the write cursor to the end of 
+        // the file
+        self.file.seek(SeekFrom::Start(file_size))?;
+        
         Ok(())
     }
 
-    pub fn truncate_front(last_index: u64) -> Result<(), Error>{
+    pub fn truncate_front(&mut self, index: u64) -> Result<(), Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
 
+        if index == 0 || self.last_index == 0 || index > self.last_index || index < self.first_index {
+            return Err(Error::OutOfRange);
+        }
+
+        if self.buffer.len() > 0 {
+            self.file.write_all(&self.buffer).expect("should write to file");
+            self.buffer = Vec::new();
+        }
+
+        // close all readers
+        // TODO check do I need readers array???
+
+        if index == self.last_index {
+            return Ok(())
+        }
+
+        let sindex = self.find_segment(index);
+        // Open file
+        let mut file = File::open(&self.segments[sindex as usize].path)?;
+        let mut reader = BufReader::new(&file);
+
+        if index > self.segments[sindex as usize].index {
+            
+            let found: bool;
+            loop {
+                let ridx = self.read_entry(&mut reader)?;
+                if ridx.index == index + 1 {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                return Err(Error::Corrupt);
+            }
+        }
+
+        // Read all entries prior to entry at index
+        let temp_filepath = self.path.join("TEMP");
+        let mut temp_file = File::create(&temp_filepath)?;
+        reader.seek(SeekFrom::Start(index + 1));
+
+        std::io::copy(&mut reader, &mut temp_file)?;
+
+        drop(file);
+        drop(temp_file);
+
+        let end_filename = self.segments[sindex as usize].path.clone();
+
+        for i in 0..sindex+1 {
+            fs::remove_file(&self.segments[i as usize].path).expect("should remove file");
+        }
+
+        fs::rename(&temp_filepath, &end_filename)?;
+
+        self.segments.insert((sindex+1) as usize,  Segment {
+            index,
+            path: end_filename.clone()
+        });
+
+        if self.segments.len() == 1 {
+            self.file = OpenOptions::new().read(true).write(true).open(end_filename.clone())?;
+            let file_size = self.file.metadata()?.len();
+            self.file_size = file_size as usize;
+            self.buffer = Vec::new();
+        }
+
+        self.first_index = index;
         Ok(())
     }
 }
