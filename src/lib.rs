@@ -1,5 +1,6 @@
 pub mod error;
 pub mod batch;
+pub mod primitives;
 
 use lazy_static::lazy_static;
 use std::fs::{self, File, create_dir_all};
@@ -9,35 +10,9 @@ use crate::error::Error;
 use std::path::{Path, PathBuf};
 use std::fmt;
 use std::fs::OpenOptions;
-use serde::{Deserialize, Serialize};
 use std::io::SeekFrom;
 use crate::batch::Batch;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Durability {
-    Low,
-    Medium,
-    High
-}
-
-#[derive(Debug, Clone)]
-pub enum LogFormat {
-    Binary,
-    JSON
-}
-
-#[derive(Debug, Clone)]
-pub struct Options {
-    pub durability: Durability,
-    pub segment_size: usize,
-    pub log_format: LogFormat
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Entry {
-    index: u64,
-    data: String,
-}
+use crate::primitives::*;
 
 lazy_static! {
     pub static ref DefaultOptions: Options = Options {
@@ -46,25 +21,11 @@ lazy_static! {
         log_format: LogFormat::Binary
     };
 
-    pub static ref MAX_READERS: i8 = 8; 
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct Segment {
-    pub path: PathBuf,
-    pub index: u64
+    pub static ref MAX_READERS: usize = 8; 
 }
 
 #[derive(Debug)]
-pub struct Reader {
-    pub sindex:  i64,
-    pub nindex: u64,
-    pub file: File,
-    pub rd: BufReader<File>,
-}
-
-#[derive(Debug)]
-pub struct Log {
+pub struct Log<'a> {
     pub path: PathBuf,
     pub opts: Options,
     pub closed: bool,
@@ -74,7 +35,7 @@ pub struct Log {
     pub file: File,
     pub buffer: Vec<u8>,
     pub file_size: usize,
-    pub readers: Vec<Reader>
+    pub readers: Vec<Reader<'a>>
 }
 
 fn abs(path: &str) -> Result<String, Error> {
@@ -136,13 +97,7 @@ fn segment_name(index: u64) -> String {
     format!("{:0>20}", index)
 }
 
-fn readEntryJSON(reader: &BufReader<File>) {
-    // let mut line = Vec::new();
-    // let len = reader.read_line(buf: &mut String);
-
-}
-
-fn readEntryBinary(reader: &mut BufReader<&File>, discard_data: bool) -> Result<(u64, Vec<u8>), std::io::Error>{
+fn read_entry_binary(reader: &mut BufReader<&File>, discard_data: bool) -> Result<Entry, std::io::Error>{
     // encoded as index data_size data
     let mut index_buf = [0; 8];
     reader.read_exact(&mut index_buf)?; // error
@@ -155,28 +110,30 @@ fn readEntryBinary(reader: &mut BufReader<&File>, discard_data: bool) -> Result<
     let mut data: Vec<u8> = vec![Default::default(); data_size];
     reader.read_exact(&mut data)?;
 
-    Ok((u64::from_be_bytes(index_buf), data))
+    Ok(Entry { index: u64::from_be_bytes(index_buf), data })
 }
 
-fn readEntry(reader: &mut BufReader<File>, log_format: &LogFormat) {
-    // match log_format {
-    //     LogFormat::JSON  => {
+fn read_entry_json(reader: &mut BufReader<&File>, log_format: &LogFormat) -> Result<Entry, Error> {
+    let mut buf = String::new();
+    match reader.read_line(&mut buf) {
+        Err(e) => if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(Error::Corrupt)
+        } else {
+            return Err(Error::File(e))
+        },
+        _ => {},
+    };
 
-    //     }
-    // }
+    let entry: Entry = match serde_json::from_str(&buf) {
+        Ok(entry) => entry,
+        Err(e) =>  return Err(Error::Corrupt),
+    };
+
+    return Ok(entry)
 }
 
-fn appendJSONEntry(entry: &Entry) {
-
-}
-
-fn appendBinaryEntry(buffer: &[u8], entry: &Entry) {
-    let index_bytes = entry.index.to_be();
-    let data_bytees = entry.data.as_bytes();
-}
-
-impl Log {
-    pub fn open(dir: &str, opts: Option<&Options>) -> Result<Log, Error>{
+impl<'a> Log<'a> {
+    pub fn open(dir: &str, opts: Option<&Options>) -> Result<Log<'a>, Error>{
         if dir == ":memory:" {
             return Err(Error::InMemoryLog);
         }
@@ -265,9 +222,9 @@ impl Log {
             LogFormat::Binary => {
                 let mut reader = BufReader::new(&file);
                 loop {
-                    match readEntryBinary(&mut reader, true) {
-                        Ok((index,_)) => {
-                            last_index = index;
+                    match read_entry_binary(&mut reader, true) {
+                        Ok(entry) => {
+                            last_index = entry.index;
                             continue;
                         },
                         Err(e) => {
@@ -347,18 +304,16 @@ impl Log {
                 let index_bytes = entry.index.to_be_bytes();
                 index_buf.clone_from_slice(&index_bytes);
 
-                let data_bytes = entry.data.as_bytes();
-
-                let data_size = data_bytes.len();
+                let data_size = entry.data.len();
                 let mut data_size_buf = [0; 8];
                 data_size_buf.clone_from_slice(&data_size.to_be_bytes());
 
                 self.buffer.extend(&index_buf);
                 self.buffer.extend(&data_size_buf);
-                self.buffer.extend(data_bytes);
+                self.buffer.extend(&entry.data);
             },
             LogFormat::JSON => {
-                let json_entry = format!("{},", serde_json::to_string(&entry).expect("serialise json"));
+                let json_entry = format!("{}\n", serde_json::to_string(&entry).expect("serialise json"));
                 let entry_bytes = json_entry.as_bytes();
                 self.buffer.extend(entry_bytes);
             }
@@ -366,6 +321,14 @@ impl Log {
 
         self.file_size += self.buffer.len() - mark;
     }
+
+    pub fn read_entry(&self, reader: &mut BufReader<&File>) -> Result<Entry, Error> {
+        match self.opts.log_format {
+            LogFormat::Binary => read_entry_binary(reader, false).map_err(Error::File),
+            LogFormat::JSON => read_entry_json(reader, &self.opts.log_format)
+        }
+    }
+
     pub fn cycle(&mut self) {
         self.flush();
         // std::mem::drop(self.file);
@@ -381,7 +344,7 @@ impl Log {
         self.buffer = Vec::new();
     }
 
-    pub fn write_batch(&mut self, batch: &Batch) -> Result<(), Error> {
+    pub fn write_batch(&mut self, batch: &mut Batch) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
         }
@@ -399,15 +362,191 @@ impl Log {
             self.cycle();
         }
 
+        let mut skip = 0;
         for i in 0..batch.indexes.len() {
-            // let data = 
+            let index = batch.indexes[i];
+            let data = batch.datas[skip..batch.data_sizes[i]].to_vec();
+            self.append_entry(&Entry { index, data });
+            skip += batch.data_sizes[i];
         }
 
+        if self.opts.durability == Durability::Medium || self.opts.durability == Durability::High || self.buffer.len() >= 4096 {
+            self.flush();
+        }
+
+        self.last_index = batch.indexes[batch.indexes.len() - 1];
+        // reset the batch for reuse
+        batch.clear();
 
         Ok(())
     }
 
-    pub fn close_reader(&self) {
+    pub fn firstindex(&self) -> Result<u64, Error>{
+        if self.closed {
+            return Err(Error::Closed);
+        }
 
+        if self.last_index == 0 {
+            return Ok(0);
+        }
+
+        Ok(self.first_index)
+    }
+
+    pub fn lastindex(&self) -> Result<u64, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        Ok(self.last_index)
+    }
+
+    pub fn read(&mut self, index: u64) -> Result<Vec<u8>, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+
+        if index == 0 || index < self.first_index || index > self.last_index {
+            return Err(Error::NotFound);
+        }
+
+        // find an opened reader
+        let mut r = None;
+        for i in 0..self.readers.len() {
+            if self.readers[i].nindex == index {
+                r = Some(&mut self.readers[i]);
+                break;
+            }
+        }
+
+        let mut reader = match r {
+            Some(r) => r,
+            // Reader not found, open a new reader and return the entry at index
+            None => return self.open_reader(index),
+        };
+
+        // Read next entry from reader
+        loop {
+            let entry = match self.read_entry(&mut reader.rd) {
+                Err(e) => {
+                    if let Error::File(e) = e {
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            if reader.sindex as usize == self.segments.len() - 1 {
+                                // At the ned of the last segment file
+                                if self.buffer.len() > 0 {
+                                    self.file.write_all(&self.buffer);
+                                    self.buffer = Vec::new();
+                                    continue;
+                                }
+
+                                self.close_reader(&reader);
+                                return Err(Error::Corrupt);
+                            }
+                            // close the old reader, open new one
+                            self.close_reader(&reader);
+                            return self.open_reader(index);
+                        }
+                    }
+                    Entry { index: 0, data: Vec::new() }
+                }  
+                Ok(e) => e,
+            };
+
+            if entry.index != index {
+                self.close_reader(&reader);
+                return Err(Error::Corrupt);
+            }
+
+            reader.nindex += 1;
+            
+            if reader.nindex == self.last_index + 1 {
+                // read the last entry, close the reader
+                self.close_reader(&reader)
+            }
+
+            return Ok(entry.data)
+        }
+    }
+
+    fn find_segment(&self, index: u64) -> u64 {
+        let i: u64 = 0;
+        let j = self.segments.len() as u64;
+
+        while i < j {
+            let h = i + (j - i) / 2;
+            if index >= self.segments[h as usize].index {
+                i = h + 1;
+            } else {
+                j = h;
+            }
+        };
+
+        i - 1 as u64
+    }
+
+    fn open_reader(&mut self, index: u64) -> Result<Vec<u8>, Error> {
+        let sindex = self.find_segment(index);
+        let mut nindex = self.segments[sindex as usize].index;
+        let file = File::open(self.segments[sindex as usize].path)?;
+        let mut buf_reader = BufReader::new(&file);
+
+        if sindex as usize == self.segments.len() - 1 {
+            if self.buffer.len() > 0 {
+                // this means we are reading from the the last segment which
+                // has an in memory buffer, therefore flush the buffer
+                // before reading from file
+                self.file.write_all(&self.buffer).expect("OpenReader: failed to write");
+                self.buffer = Vec::new(); 
+            }
+        }
+
+        // scan the file for entry at index
+        loop {
+            let data = self.read_entry(&mut buf_reader)?;
+            if data.index != nindex {
+                return Err(Error::Corrupt);
+            }
+
+            nindex = data.index + 1;
+
+            if data.index == index {
+                // create new reader push it to the front
+                let reader = Reader {
+                    sindex,
+                    nindex,
+                    file,
+                    rd: buf_reader
+                };
+
+                self.readers.insert(0, reader);
+                // loop and close readers
+                while self.readers.len() > *MAX_READERS {
+                    self.close_reader(&mut self.readers[self.readers.len() - 1]);
+                }
+            }
+
+            return Ok(data.data);
+        }
+
+        // Ok(Vec::new())
+    }
+
+    pub fn close_reader(&mut self, reader: &Reader) {
+        for i in 0..self.readers.len() {
+            if self.readers[i].sindex == reader.sindex && self.readers[i].nindex == reader.nindex {
+                self.readers[i] = self.readers[self.readers.len() - 1];
+                self.readers.remove(self.readers.len() - 1);
+                break;
+            }
+        }
+    }
+
+    pub fn truncate_back(last_index: u64) -> Result<(), Error>{
+
+        Ok(())
+    }
+
+    pub fn truncate_front(last_index: u64) -> Result<(), Error>{
+
+        Ok(())
     }
 }
