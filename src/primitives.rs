@@ -36,9 +36,9 @@ pub struct Segment {
 }
 
 #[derive(Debug)]
-pub struct Reader<'a> {
+pub struct Reader {
     pub sindex:  u64,
     pub nindex: u64,
-    pub file: File,
-    pub rd: BufReader<&'a File>,
+    // pub file: File,
+    pub rd: BufReader<File>,
 }

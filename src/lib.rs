@@ -29,7 +29,7 @@ lazy_static! {
  */
 
 #[derive(Debug)]
-pub struct Log<'a> {
+pub struct Log {
     pub path: PathBuf,
     pub opts: Options,
     pub closed: bool,
@@ -39,7 +39,7 @@ pub struct Log<'a> {
     pub file: File,
     pub buffer: Vec<u8>,
     pub file_size: usize,
-    pub readers: Vec<Reader<'a>>
+    pub readers: Vec<Reader>
 }
 
 fn abs(path: &str) -> Result<String, Error> {
@@ -417,24 +417,27 @@ impl<'a> Log<'a> {
         let mut r = None;
         for i in 0..self.readers.len() {
             if self.readers[i].nindex == index {
-                r = Some(&mut self.readers[i]);
+                // r = Some(&mut self.readers[i]);
+                r = Some(index);
                 break;
             }
         }
 
-        let mut reader = match r {
+        let mut reader_index = match r {
             Some(r) => r,
             // Reader not found, open a new reader and return the entry at index
             None => return self.open_reader(index),
         };
 
         // Read next entry from reader
+        let sindex = self.readers[reader_index as usize].sindex;
+        let nindex = self.readers[reader_index as usize].nindex;
         loop {
-            let entry = match self.read_entry(&mut reader.rd) {
+            let entry = match self.read_entry(&mut self.readers[reader_index as usize].rd) {
                 Err(e) => {
                     if let Error::File(e) = e {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            if reader.sindex as usize == self.segments.len() - 1 {
+                            if sindex as usize == self.segments.len() - 1 {
                                 // At the ned of the last segment file
                                 if self.buffer.len() > 0 {
                                     self.file.write_all(&self.buffer);
@@ -442,29 +445,29 @@ impl<'a> Log<'a> {
                                     continue;
                                 }
 
-                                self.close_reader(&reader);
+                                self.close_reader(&self.readers[reader_index as usize]);
                                 return Err(Error::Corrupt);
                             }
                             // close the old reader, open new one
-                            self.close_reader(&reader);
+                            self.close_reader(&self.readers[reader_index as usize]);
                             return self.open_reader(index);
                         }
                     }
                     Entry { index: 0, data: Vec::new() }
                 }  
-                Ok(e) => e,
+                Ok(e) => e.to_owned(),
             };
 
             if entry.index != index {
-                self.close_reader(&reader);
+                self.close_reader(&self.readers[reader_index as usize]);
                 return Err(Error::Corrupt);
             }
 
-            reader.nindex += 1;
+            self.readers[reader_index as usize].nindex += 1;
             
-            if reader.nindex == self.last_index + 1 {
+            if nindex == self.last_index + 1 {
                 // read the last entry, close the reader
-                self.close_reader(&reader)
+                self.close_reader(&self.readers[reader_index as usize])
             }
 
             return Ok(entry.data)
@@ -490,7 +493,7 @@ impl<'a> Log<'a> {
     fn open_reader(&mut self, index: u64) -> Result<Vec<u8>, Error> {
         let sindex = self.find_segment(index);
         let mut nindex = self.segments[sindex as usize].index;
-        let file = File::open(self.segments[sindex as usize].path)?;
+        let file = File::open(self.segments[sindex as usize].path.clone())?;
         let mut buf_reader = BufReader::new(&file);
 
         if sindex as usize == self.segments.len() - 1 {
@@ -517,7 +520,7 @@ impl<'a> Log<'a> {
                 let reader = Reader {
                     sindex,
                     nindex,
-                    file,
+                    // file,
                     rd: buf_reader
                 };
 
@@ -701,5 +704,13 @@ impl<'a> Log<'a> {
 
         self.first_index = index;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn open_log() {
+        unimplemented!();
     }
 }
