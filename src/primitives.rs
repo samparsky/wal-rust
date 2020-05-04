@@ -39,6 +39,5 @@ pub struct Segment {
 pub struct Reader {
     pub sindex:  u64,
     pub nindex: u64,
-    // pub file: File,
     pub rd: BufReader<File>,
 }
