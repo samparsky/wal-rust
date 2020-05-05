@@ -12,9 +12,9 @@ impl Batch {
         }
     }
     
-    pub fn write(&mut self, data: Vec<u8>) {
-        self.data_sizes.push(data.len());
-        self.datas.extend(&data)
+    pub fn write<D: AsRef<[u8]>>(&mut self, data: D) {
+        self.data_sizes.push(data.as_ref().len());
+        self.datas.extend(data.as_ref())
     }
 
     pub fn clear(&mut self) {

@@ -18,7 +18,7 @@ lazy_static! {
     pub static ref DEFAULT_OPTIONS: Options = Options {
         durability: Durability::High,
         segment_size: 52428800, // 50 Mb log segment files
-        log_format: LogFormat::Binary
+        log_format: LogFormat::JSON
     };
 
     pub static ref MAX_READERS: usize = 8; 
@@ -50,13 +50,12 @@ pub struct Log {
     pub path: PathBuf,
     pub opts: Options,
     pub closed: bool,
-    pub segments: Vec<Segment>,
-    pub first_index: u64,
-    pub last_index: u64,
-    pub file: BufWriter<File>,
-    // pub buffer: Vec<u8>,
-    pub file_size: usize,
-    pub readers: Vec<Reader>
+    segments: Vec<Segment>,
+    first_index: u64,
+    last_index: u64,
+    file: BufWriter<File>,
+    file_size: usize,
+    readers: Vec<Reader>
 }
 
 fn load_segments(dir: &str) -> Result<(usize, usize, Vec<Segment>), Error>{
@@ -83,13 +82,6 @@ fn load_segments(dir: &str) -> Result<(usize, usize, Vec<Segment>), Error>{
             Ok(i) if i == 0 => continue,
             Ok(i) => i,
         };
-        // if index.is_err() {
-        //     continue;
-        // }
-        // let index = index.expect("should have value");
-        // if index == 0 {
-        //     continue;
-        // }
 
         let is_start = name.len() == 26 && name.ends_with(".START");
         let is_end = name.len() == 24 && name.ends_with(".END");
@@ -148,27 +140,29 @@ fn read_entry_binary_ref(reader: &mut BufReader<&File>, discard_data: bool) -> R
 
 fn read_entry_json_ref(reader: &mut BufReader<&File>) -> Result<Entry, Error> {
     let mut buf = String::new();
-    match reader.read_line(&mut buf) {
-        Err(e) => if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            return Err(Error::Corrupt)
-        } else {
-            return Err(Error::File(e))
-        },
+    // println!("buf {}", buf.len());
+    let read_result = reader.read_line(&mut buf);
+    // println!("{:?}", read_result);
+    match read_result {
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && buf.len() > 0  => return Err(Error::Corrupt),
+        Err(e) => return Err(Error::File(e)),
+        Ok(0) => return Err(Error::File(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty file"))),
         _ => {},
     };
-
+    // println!("buf2 {}", buf);
     let entry: Entry = match serde_json::from_str(&buf) {
         Ok(entry) => entry,
-        Err(e) =>  return Err(Error::Corrupt),
+        Err(_e) =>  return Err(Error::Corrupt),
     };
 
     return Ok(entry)
 }
 
-fn read_entry_json(reader: &mut BufReader<File>, log_format: &LogFormat) -> Result<Entry, Error> {
+fn read_entry_json(reader: &mut BufReader<File>, _log_format: &LogFormat) -> Result<Entry, Error> {
     let mut buf = String::new();
     match reader.read_line(&mut buf) {
-        Err(e) => if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        Err(e) => if e.kind() == std::io::ErrorKind::UnexpectedEof && buf.len() > 0 {
+            println!("buf {}",  buf);
             return Err(Error::Corrupt)
         } else {
             return Err(Error::File(e))
@@ -178,7 +172,7 @@ fn read_entry_json(reader: &mut BufReader<File>, log_format: &LogFormat) -> Resu
 
     let entry: Entry = match serde_json::from_str(&buf) {
         Ok(entry) => entry,
-        Err(e) =>  return Err(Error::Corrupt),
+        Err(_e) =>  return Err(Error::Corrupt),
     };
 
     return Ok(entry)
@@ -186,6 +180,7 @@ fn read_entry_json(reader: &mut BufReader<File>, log_format: &LogFormat) -> Resu
 
 impl Log {
     pub fn open(dir: &str, opts: Option<&Options>) -> Result<Log, Error>{
+        println!("in testing ");
         if dir == ":memory:" {
             return Err(Error::InMemoryLog);
         }
@@ -278,7 +273,7 @@ impl Log {
                             last_index = entry.index;
                             continue;
                         },
-                        Err(Error::File(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof =>  break,
+                        Err(Error::File(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                         Err(e) => return Err(e),
                     }
                 }
@@ -300,6 +295,8 @@ impl Log {
                 }
             }
         };
+
+        println!("after testing",);
 
         let mut writer = BufWriter::new(file);
         
@@ -348,7 +345,7 @@ impl Log {
         };
     }
 
-    pub fn write(&mut self, index: u64, data: &[u8]) -> Result<(), Error> {
+    pub fn write<D: AsRef<[u8]>>(&mut self, index: u64, data: D) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
         }
@@ -375,7 +372,7 @@ impl Log {
         Ok(())
     }
 
-    fn append_entry(&mut self, index: u64, data: &[u8]) {
+    fn append_entry<D: AsRef<[u8]>>(&mut self, index: u64, data: D) {
         let mark = self.file.buffer().len();
         match self.opts.log_format {
             LogFormat::Binary => {
@@ -384,18 +381,18 @@ impl Log {
                 let index_bytes = index.to_be_bytes();
                 index_buf.clone_from_slice(&index_bytes);
 
-                let data_size = data.len();
+                let data_size = data.as_ref().len();
                 let mut data_size_buf = [0; 8];
                 data_size_buf.clone_from_slice(&data_size.to_be_bytes());
 
                 self.file.write(&index_buf).expect("Failed to append entry index buf");
                 self.file.write(&data_size_buf).expect("Failed to append entry index buf");
-                self.file.write(&data).expect("Failed to append entry index buf");
+                self.file.write(&data.as_ref()).expect("Failed to append entry index buf");
             },
             LogFormat::JSON => {
                 let entry = Entry {
                     index,
-                    data: data.to_vec()
+                    data: data.as_ref().to_vec()
                 };
                 let json_entry = format!("{}\n", serde_json::to_string(&entry).expect("serialise json"));
                 let entry_bytes = json_entry.as_bytes();
@@ -413,8 +410,8 @@ impl Log {
         }
     }
 
-    fn read_entry_with_index(&mut self, reader_index: u64) -> Result<Entry, Error> {
-        let reader = &mut self.readers[reader_index as usize].rd;
+    fn read_entry_with_index(&mut self, reader_index: usize) -> Result<Entry, Error> {
+        let reader = &mut self.readers[reader_index].rd;
         match self.opts.log_format {
             LogFormat::Binary => read_entry_binary(reader, false).map_err(Error::File),
             LogFormat::JSON => read_entry_json(reader, &self.opts.log_format)
@@ -441,9 +438,9 @@ impl Log {
         if self.closed {
             return Err(Error::Closed);
         }
-
+        println!("detecting");
         // check indexes
-        if batch.data_sizes.len() != batch.datas.len() {
+        if batch.data_sizes.iter().sum::<usize>() != batch.datas.len() {
             return Err(Error::OutofOrder);
         }
 
@@ -451,10 +448,12 @@ impl Log {
             self.cycle();
         }
 
+        println!("{:?}", batch);
+
         let mut skip = 0;
-        for i in 0..batch.datas.len() {
-            let index = self.last_index + i as u64;
-            let data = &batch.datas[skip..batch.data_sizes[i]];
+        for i in 0..batch.data_sizes.len() {
+            let index = self.last_index + i as u64 + 1;
+            let data = &batch.datas[skip..batch.data_sizes[i] + skip];
             self.append_entry(index, &data);
             skip += batch.data_sizes[i];
         }
@@ -464,7 +463,7 @@ impl Log {
             self.flush();
         }
 
-        self.last_index += batch.datas.len() as u64;
+        self.last_index += batch.data_sizes.len() as u64;
         // reset the batch for reuse
         batch.clear();
 
@@ -510,7 +509,7 @@ impl Log {
         for i in 0..self.readers.len() {
             if self.readers[i].nindex == index {
                 // r = Some(&mut self.readers[i]);
-                r = Some(index);
+                r = Some(i);
                 break;
             }
         }
@@ -633,7 +632,7 @@ impl Log {
         // Ok(Vec::new())
     }
 
-    pub fn close_reader(&mut self, reader: &Reader) {
+    // pub fn close_reader(&mut self, reader: &Reader) {
         // for i in 0..self.readers.len() {
         //     if self.readers[i].sindex == reader.sindex && self.readers[i].nindex == reader.nindex {
         //         self.readers[i] = self.readers[self.readers.len() - 1];
@@ -641,7 +640,7 @@ impl Log {
         //         break;
         //     }
         // }
-    }
+    // }
 
     pub fn truncate_back(&mut self, last_index: u64) -> Result<(), Error> {
         if self.closed {
@@ -779,7 +778,8 @@ impl Log {
         // Read all entries prior to entry at index
         let temp_filepath = self.path.join("TEMP");
         let mut temp_file = File::create(&temp_filepath)?;
-        reader.seek(SeekFrom::Start(index + 1));
+        // @TODO please confirm behavior
+        reader.seek(SeekFrom::Start(index + 1)).expect("failed to seek");
 
         std::io::copy(&mut reader, &mut temp_file)?;
 
@@ -810,5 +810,296 @@ impl Log {
 
         self.first_index = index;
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod test {
+    // use super::primitives::*;
+    use super::Log;
+    use crate::error::*;
+    use crate::Batch;
+    use std::fs;
+    use std::str;
+
+    fn data_str(i: u64) -> String {
+        format!("data-{}", i)
+    }
+    
+    fn test_first_last(log: &Log, expect_first: u64, expect_last: u64) {
+        let first_index = log.firstindex().expect("should return first index");
+        assert_eq!(first_index, expect_first, "TestFirstLast; FirstIndex: expected {}, got {}", expect_first, first_index);
+
+        let last_index = log.lastindex().expect("Should return last index");
+        assert_eq!(last_index, expect_last, "TestFirstLast; LastIndex: expected {}, got {}", expect_last, last_index);
+    }
+
+    #[test]
+    fn test_log() {
+        let mut N: u64 = 100;
+        // unimplemented!();
+        let path = "testlog/log";
+        let mut log = Log::open(path, None).expect("should open log");
+
+        // FirstIndex - should be zero
+        let first_index = log.firstindex().expect("should return first index");
+        assert_eq!(first_index, 0, "FirstIndex: expected {}, got {}", 0, first_index);
+
+        // LastIndex
+        let last_index = log.lastindex().expect("Should return last index");
+        assert_eq!(last_index, 0, "LastIndex: expected {}, got {}", 0, last_index);
+
+
+        for i in 1..N+1 {
+            // write - try to apprend previous index should fial
+            match log.write(i-1, data_str(i)) {
+                Err(Error::OutofOrder) => {},
+                _ => panic!("Write: should throw error")
+            };
+            
+            // Write - append next item
+            log.write(i, data_str(i)).expect("Write: should append item successfully");
+
+            // Write - get next item
+            let data = log.read(i).expect("Write: should read item");
+
+            assert_eq!(
+                str::from_utf8(&data).expect("should be valid"),
+                data_str(i),
+                "Write: expected {}, got {}",
+                data_str(i),
+                str::from_utf8(&data).expect("should be valid"),
+            );
+        }
+
+        // Read - should fail, not found
+        match log.read(0) {
+            Err(Error::NotFound) => {},
+            _ => panic!("Read: should throw not found error")
+        };
+
+        // Read - read back all entries
+        for i in 1..N {
+            let data = log.read(i).expect("Read: should read entry");
+            assert_eq!(
+                str::from_utf8(&data).expect("should be valid"),
+                data_str(i),
+                "Write: expected {}, got {}",
+                data_str(i),
+                str::from_utf8(&data).expect("should be valid"),
+            );
+        }
+
+        // Read - read back first half entries
+        for i in 1..N/2 {
+            let data = log.read(i).expect("Read: should read entry");
+            assert_eq!(
+                str::from_utf8(&data).expect("should be valid"),
+                data_str(i),
+                "Write: expected {}, got {}",
+                data_str(i),
+                str::from_utf8(&data).expect("should be valid"),
+            );
+        }
+
+        //@TODO Read - random access
+
+        // FirstIndex/LastIndex -- check valid first and last indexes
+        
+        let first_index = log.firstindex().expect("should get firstindex");
+        assert_eq!(first_index, 1, "FirstIndex1: expected {}, got {}", 1, first_index);
+
+        let last_index = log.lastindex().expect("Should return last index");
+        assert_eq!(last_index, N, "LastIndex: expected {}, got {}", N, last_index);
+
+        // Close - close the log
+        log.close().expect("Close: should close log");
+
+        // Write - try while closed
+        match log.write(1, "test") {
+            Err(Error::Closed) => {},
+            _ => panic!("Close: should fail to write when closed")
+        };
+        // @TODO WriteBatch - try while closed
+        
+        // FirstIndex - try while closed
+        match log.firstindex() {
+            Err(Error::Closed) => {},
+            _ => panic!("Close: should fail to write when closed")
+        };
+
+        // LastIndex - try while closed
+        match log.lastindex() {
+            Err(Error::Closed) => {},
+            _ => panic!("Close: should fail to write when closed")
+        };
+
+        // Get - try while closed
+        match log.read(1) {
+            Err(Error::Closed) => {},
+            _ => panic!("Close: should fail to write when closed")
+        };
+
+        // TruncateFront - try while closed
+        match log.truncate_front(1) {
+            Err(Error::Closed) => {},
+            _ => panic!("Close: should fail to write when closed")
+        };
+
+        // TruncateBack - try while closed
+        match log.truncate_back(1) {
+            Err(Error::Closed) => {},
+            _ => panic!("Close: should fail to write when closed")
+        };
+
+        // Open -- reopen log
+        let mut log = Log::open(path, None).expect("should re-open log");
+        
+        // Read - read back all entries
+        for i in 1..N+1 {
+            let data = log.read(i).expect("Read: should read entry");
+            assert_eq!(
+                str::from_utf8(&data).expect("should be valid"),
+                data_str(i),
+                "Write: expected {}, got {}",
+                data_str(i),
+                str::from_utf8(&data).expect("should be valid"),
+            );
+        }
+
+        // FirstIndex - should be 1
+        let first_index = log.firstindex().expect("should return first index");
+        assert_eq!(first_index, 1, "FirstIndex: expected {}, got {}", 1, first_index);
+
+        // LastIndex
+        let last_index = log.lastindex().expect("Should return last index");
+        assert_eq!(last_index, N, "LastIndex: expected {}, got {}", N, last_index);
+
+        // Write -- add 50 more items
+        for i in N+1..N+51 {
+            // Write - append next item
+            log.write(i, data_str(i)).expect("Write: should append item successfully");
+
+            // Write - get next item
+            let data = log.read(i).expect("Write: should read item");
+
+            assert_eq!(
+                str::from_utf8(&data).expect("should be valid"),
+                data_str(i),
+                "Write: expected {}, got {}",
+                data_str(i),
+                str::from_utf8(&data).expect("should be valid"),
+            );
+        }
+        N += 50;
+        // FirstIndex/LastIndex -- check valid first and last indexes
+
+        // FirstIndex - should be 1
+        let first_index = log.firstindex().expect("should return first index");
+        assert_eq!(first_index, 1, "FirstIndex: expected {}, got {}", 1, first_index);
+
+        let last_index = log.lastindex().expect("Should return last index");
+        assert_eq!(last_index, N, "LastIndex: expected {}, got {}", N, last_index);
+
+
+        // Batch -- test batch writes
+        let mut batch = Batch::new();
+        // WriteBatch -- should succeed
+        log.write_batch(&mut batch).expect("Failed to write batch");
+
+        // Write 100 entries in batches of 10
+        for _i in 1..11 {
+            for j in 1..11 {
+                N += 1;
+                batch.write(&data_str(N));
+            }
+            log.write_batch(&mut batch).expect("Failed to write batch");
+        }
+        
+        // Read -- read back all entries
+        for i in 1..N+1 {
+            let data = log.read(i).expect("Read: should read entry");
+            assert_eq!(
+                str::from_utf8(&data).expect("should be valid"),
+                data_str(i),
+                "Write: expected {}, got {}",
+                data_str(i),
+                str::from_utf8(&data).expect("should be valid"),
+            );
+        }
+
+        //@TODO Read -- one random read, so there is an opened reader
+
+
+        // @TODO TruncateFront -- should fail, out of range
+
+        
+    	// TruncateFront -- should fail, out of range
+        match log.truncate_front(0) {
+            Err(Error::OutOfRange) => {},
+            _ => panic!("TruncateFront: Expected OutOfRange error")
+        };
+        test_first_last(&log,1, N);
+
+        // TruncateFront -- Remove no entries
+        match log.truncate_front(1) {
+            // Err(Error::OutOfRange) => {},
+            Ok(()) => {}
+            Err(e) => panic!(format!("TruncateFront Error: {}", e))
+        };
+        test_first_last(&log, 1, N);
+        // TruncateFront -- Remove first 80 entries
+        match log.truncate_front(81) {
+            // Err(Error::OutOfRange) => {},
+            Ok(()) => {},
+            _ => panic!("TruncateFront: Expected OutOfRange error")
+        };
+        test_first_last(&log, 81, N);
+
+        //@TODO Write -- one entry, so the buffer might be activated
+        //@TODO Read -- one random read, so there is an opened reader
+
+        // TruncateBack -- should fail, out of range
+        //@TODO TruncateBack -- should fail, out of range
+
+        // TruncateBack -- Remove no entries
+        match log.truncate_back(N) {
+            Ok(()) => {},
+            Err(e) => panic!(format!("TruncateBackN: {}", e))
+        };
+        test_first_last(&log, 81, N);
+
+        // TruncateBack -- Remove last 80 entries
+        match log.truncate_back(N - 80) {
+            Ok(()) => {},
+            Err(e) => panic!(format!("TruncateBack80: {}", e))
+        };
+        N -= 80;
+        test_first_last(&log, 81, N);
+
+        // Close -- close log after truncating
+        log.close().expect("Should close file");
+
+        // Open -- open log after truncating
+        let mut log = Log::open(path, None).expect("should re-open log after truncating");
+        test_first_last(&log, 81, N);
+
+        // Read -- read back all entries
+        for i in 81..N+1 {
+            let data = log.read(i).expect("Read: should read entry");
+            assert_eq!(
+                str::from_utf8(&data).expect("should be valid"),
+                data_str(i),
+                "Write: expected {}, got {}",
+                data_str(i),
+                str::from_utf8(&data).expect("should be valid"),
+            );
+        }
+
+        // TruncateFront -- truncate all entries but one
+        log.truncate_front(N).expect("TruncateFront: all entries but one");
+        test_first_last(&log, N, N);
+        fs::remove_dir_all("testlog").expect("should remove dir");
     }
 }
