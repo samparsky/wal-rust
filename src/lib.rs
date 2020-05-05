@@ -15,13 +15,14 @@ use crate::batch::Batch;
 use crate::primitives::*;
 
 lazy_static! {
-    pub static ref DefaultOptions: Options = Options {
+    pub static ref DEFAULT_OPTIONS: Options = Options {
         durability: Durability::High,
         segment_size: 52428800, // 50 Mb log segment files
         log_format: LogFormat::Binary
     };
 
     pub static ref MAX_READERS: usize = 8; 
+    pub static ref MAX_BUFFER_SIZE: usize = 8096;
 }
 
 /**
@@ -53,17 +54,9 @@ pub struct Log {
     pub first_index: u64,
     pub last_index: u64,
     pub file: BufWriter<File>,
-    pub buffer: Vec<u8>,
+    // pub buffer: Vec<u8>,
     pub file_size: usize,
     pub readers: Vec<Reader>
-}
-
-fn abs(path: &str) -> Result<String, Error> {
-    if path == ":memory" {
-        Err(Error::InMemoryLog)
-    } else {
-        Ok(String::new())
-    }
 }
 
 fn load_segments(dir: &str) -> Result<(usize, usize, Vec<Segment>), Error>{
@@ -85,22 +78,26 @@ fn load_segments(dir: &str) -> Result<(usize, usize, Vec<Segment>), Error>{
             continue;
         }
 
-        let index = u64::from_str_radix(&name[..20], 10);
-        if index.is_err() {
-            continue;
-        }
-        let index = index.expect("should have value");
-        if index == 0 {
-            continue;
-        }
+        let index = match u64::from_str_radix(&name[..20], 10) {
+            Err(_) => continue,
+            Ok(i) if i == 0 => continue,
+            Ok(i) => i,
+        };
+        // if index.is_err() {
+        //     continue;
+        // }
+        // let index = index.expect("should have value");
+        // if index == 0 {
+        //     continue;
+        // }
 
-        let start = name.len() == 26 && name.ends_with(".START");
-        let end = name.len() == 24 && name.ends_with(".END");
+        let is_start = name.len() == 26 && name.ends_with(".START");
+        let is_end = name.len() == 24 && name.ends_with(".END");
 
-        if name.len() == 20 || start || end {
-            if start {
+        if name.len() == 20 || is_start || is_end {
+            if is_start {
                 start_index = segments.len();
-            } else if end && end_index == 0 {
+            } else if is_end && end_index == 0 {
                 end_index = segments.len();
             }
             segments.push( Segment {
@@ -149,6 +146,25 @@ fn read_entry_binary_ref(reader: &mut BufReader<&File>, discard_data: bool) -> R
     Ok(Entry { index: u64::from_be_bytes(index_buf), data })
 }
 
+fn read_entry_json_ref(reader: &mut BufReader<&File>) -> Result<Entry, Error> {
+    let mut buf = String::new();
+    match reader.read_line(&mut buf) {
+        Err(e) => if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(Error::Corrupt)
+        } else {
+            return Err(Error::File(e))
+        },
+        _ => {},
+    };
+
+    let entry: Entry = match serde_json::from_str(&buf) {
+        Ok(entry) => entry,
+        Err(e) =>  return Err(Error::Corrupt),
+    };
+
+    return Ok(entry)
+}
+
 fn read_entry_json(reader: &mut BufReader<File>, log_format: &LogFormat) -> Result<Entry, Error> {
     let mut buf = String::new();
     match reader.read_line(&mut buf) {
@@ -175,20 +191,21 @@ impl Log {
         }
 
         let path_dir = Path::new(&dir);
-        let options = opts.unwrap_or_else(|| &DefaultOptions);
+        let options = opts.unwrap_or_else(|| &DEFAULT_OPTIONS);
         // create all directory
         create_dir_all(dir)?;
 
         let (start_index, end_index, mut segments) = load_segments(&dir)?;
 
-        let mut first_index = 1;
-        let mut last_index = 0;
+        // let mut first_index = 1;
+        // let mut last_index = 0;
 
-        let mut file: File;
+        // let mut file: File;
 
         if segments.len() == 0 {
             let file_path = path_dir.join(&segment_name(1));
-            file = File::create(&file_path)?;
+            // create file
+            File::create(&file_path)?;
 
             segments.push(
                 Segment {
@@ -200,9 +217,10 @@ impl Log {
 
         if start_index != 0 {
             if end_index != 0 {
+                // There should not be a START and END at the same time
                 return Err(Error::Corrupt);
             }
-
+            // Delete all files leading up to START
             for index in 0..start_index {
                 let file_path = segments[index].path.clone();
                 fs::remove_file(file_path)?;
@@ -211,13 +229,14 @@ impl Log {
             segments =  segments[start_index..].to_vec();
             // rename START segment
             let org_path = segments[0].path.to_str().expect("should have a valid path");
-            let file_name_index = org_path.len() - ".start".len();
+            let file_name_index = org_path.len() - ".START".len();
             // rename 
             fs::rename(org_path, &org_path[..file_name_index])?;
             segments[0].path = Path::new(&org_path[..file_name_index]).to_path_buf();
         };
 
         if end_index != 0 {
+            // Delete all files following END
             for index in ((end_index + 1)..segments.len() - 1).rev() {
                 fs::remove_file(segments[index].path.clone())?;
             }
@@ -226,37 +245,45 @@ impl Log {
 
             if segments.len() > 1 && segments[segments.len() - 2 ].index == segments[segments.len() - 1].index {
                 let len = segments.len();
+                // remove the segment prior to the END segment because it shares
+			    // the same starting index.
                 segments[len - 2] = segments[len - 1].clone();
-                segments = segments[..segments.len() - 1].to_vec();
+                segments.pop(); // remove last item
+                // segments = segments[..segments.len() - 1].to_vec();
             }
 
             // rename END segment
             let org_path = segments[segments.len() - 1].path.to_str().expect("should have a valid path");
-            let file_name_index = org_path.len() - ".end".len();
+            let file_name_index = org_path.len() - ".END".len();
             // rename 
             fs::rename(org_path, &org_path[..file_name_index])?;
-            segments[0].path = Path::new(&org_path[..file_name_index]).to_path_buf();
+            let len = segments.len();
+            segments[len - 1].path = Path::new(&org_path[..file_name_index]).to_path_buf();
         };
 
-        first_index = segments[0].index;
+        let first_index = segments[0].index;
+        let mut last_index = 0;
         let last_path = segments[segments.len() - 1].path.clone();
-        file = OpenOptions::new().read(true).write(true).open(last_path.clone())?;
+        let file = OpenOptions::new().read(true).write(true).open(last_path.clone())?;
         let file_size = file.metadata()?.len();
 
         // read the last segment to the end of log
+        let mut reader = BufReader::new(&file);
+
         match options.log_format {
             LogFormat::JSON => {
-                let data = fs::read_to_string(last_path)?;
-                let parsed_data: Vec<Entry> = match serde_json::from_str(&data){
-                    Ok(data) => data,
-                    Err(_) => return Err(Error::Corrupt) // verify this behaviour
-                };
-                last_index = parsed_data[parsed_data.len() - 1].index;
-                // convert it from json
-                // 1
+                loop {
+                    match read_entry_json_ref(&mut reader) {
+                        Ok(entry) => {
+                            last_index = entry.index;
+                            continue;
+                        },
+                        Err(Error::File(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof =>  break,
+                        Err(e) => return Err(e),
+                    }
+                }
             },
             LogFormat::Binary => {
-                let mut reader = BufReader::new(&file);
                 loop {
                     match read_entry_binary_ref(&mut reader, true) {
                         Ok(entry) => {
@@ -274,14 +301,15 @@ impl Log {
             }
         };
 
-        let writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(file);
         
         // move the write cursor to the end of 
         // the file
 
-        // @TODO this should be BufReader seek
+        // @TODO this should be BufWriter seek
         // and not file seek
         // file.seek(SeekFrom::Start(file_size))?;
+        writer.seek(SeekFrom::Start(file_size))?;
 
         Ok(Log {
             path: Path::new(&dir).to_path_buf(),
@@ -291,7 +319,7 @@ impl Log {
             first_index,
             last_index,
             file: writer,
-            buffer: Vec::new(),
+            // buffer: Vec::new(),
             file_size: file_size as usize,
             readers: Vec::new(),
         })
@@ -302,26 +330,30 @@ impl Log {
             return Err(Error::Closed);
         };
         self.flush();
+        self.closed = true;
+        self.segments.clear();
+        self.readers.clear();
         Ok(())
     }
 
-    pub fn flush(&mut self) {
-        if self.buffer.len() > 0 {
+    fn flush(&mut self) {
+        if self.file.buffer().len() > 0 {
             // must write buffer or crash
-            self.file.write_all(&self.buffer).expect("Flush: Failed to write to file");
-            self.buffer = Vec::new();
+            // self.file.write_all(&self.buffer).expect("Flush: Failed to write to file");
+            // self.buffer = Vec::new();
+            self.file.flush().expect("Flush: Failed to write to file");
             if self.opts.durability == Durability::High {
                 self.file.get_ref().sync_all().expect("Flush: Failed to sync data;");
             }
         };
     }
 
-    pub fn write(&mut self, entry: &Entry) -> Result<(), Error> {
+    pub fn write(&mut self, index: u64, data: &[u8]) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
         }
 
-        if entry.index != self.last_index + 1 {
+        if index != self.last_index + 1 {
             return Err(Error::OutofOrder);
         }
 
@@ -331,36 +363,47 @@ impl Log {
         }
 
         // appendEntry
-        self.append_entry(&entry);
+        self.append_entry(index, data);
+
+        // check durability
+        if self.opts.durability >= Durability::Medium || self.file.buffer().len() > *MAX_BUFFER_SIZE {
+            self.flush();
+        }
+        
+        self.last_index = index;
 
         Ok(())
     }
 
-    pub fn append_entry(&mut self, entry: &Entry) {
-        let mark = self.buffer.len();
+    fn append_entry(&mut self, index: u64, data: &[u8]) {
+        let mark = self.file.buffer().len();
         match self.opts.log_format {
             LogFormat::Binary => {
 
                 let mut index_buf = [0; 8];
-                let index_bytes = entry.index.to_be_bytes();
+                let index_bytes = index.to_be_bytes();
                 index_buf.clone_from_slice(&index_bytes);
 
-                let data_size = entry.data.len();
+                let data_size = data.len();
                 let mut data_size_buf = [0; 8];
                 data_size_buf.clone_from_slice(&data_size.to_be_bytes());
 
-                self.buffer.extend(&index_buf);
-                self.buffer.extend(&data_size_buf);
-                self.buffer.extend(&entry.data);
+                self.file.write(&index_buf).expect("Failed to append entry index buf");
+                self.file.write(&data_size_buf).expect("Failed to append entry index buf");
+                self.file.write(&data).expect("Failed to append entry index buf");
             },
             LogFormat::JSON => {
+                let entry = Entry {
+                    index,
+                    data: data.to_vec()
+                };
                 let json_entry = format!("{}\n", serde_json::to_string(&entry).expect("serialise json"));
                 let entry_bytes = json_entry.as_bytes();
-                self.buffer.extend(entry_bytes);
+                self.file.write(&entry_bytes).expect("Failed to append entry json");
             }
         };
 
-        self.file_size += self.buffer.len() - mark;
+        self.file_size += self.file.buffer().len() - mark;
     }
 
     pub fn read_entry(&self, reader: &mut BufReader<File>) -> Result<Entry, Error> {
@@ -370,7 +413,7 @@ impl Log {
         }
     }
 
-    pub fn read_entry_with_index(&mut self, reader_index: u64) -> Result<Entry, Error> {
+    fn read_entry_with_index(&mut self, reader_index: u64) -> Result<Entry, Error> {
         let reader = &mut self.readers[reader_index as usize].rd;
         match self.opts.log_format {
             LogFormat::Binary => read_entry_binary(reader, false).map_err(Error::File),
@@ -378,11 +421,10 @@ impl Log {
         }
     }
 
-    pub fn cycle(&mut self) {
+    fn cycle(&mut self) {
         self.flush();
         // std::mem::drop(self.file);
         // fn cycle(&mut self)
-
         let segment = Segment {
             index: self.last_index + 1,
             path: self.path.join(&segment_name(self.last_index + 1))
@@ -392,21 +434,17 @@ impl Log {
         self.file = BufWriter::new(file);
         self.file_size = 0;
         self.segments.push(segment);
-        self.buffer = Vec::new();
+        // self.buffer = Vec::new();
     }
 
     pub fn write_batch(&mut self, batch: &mut Batch) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
         }
-        if batch.indexes.len() == 0 {
-            return Ok(());
-        }
+
         // check indexes
-        for i in 0..batch.indexes.len() {
-            if batch.indexes[i] != self.last_index + i as u64 + 1 {
-                return Err(Error::OutofOrder);
-            }
+        if batch.data_sizes.len() != batch.datas.len() {
+            return Err(Error::OutofOrder);
         }
 
         if self.file_size >= self.opts.segment_size {
@@ -414,24 +452,27 @@ impl Log {
         }
 
         let mut skip = 0;
-        for i in 0..batch.indexes.len() {
-            let index = batch.indexes[i];
-            let data = batch.datas[skip..batch.data_sizes[i]].to_vec();
-            self.append_entry(&Entry { index, data });
+        for i in 0..batch.datas.len() {
+            let index = self.last_index + i as u64;
+            let data = &batch.datas[skip..batch.data_sizes[i]];
+            self.append_entry(index, &data);
             skip += batch.data_sizes[i];
         }
-
-        if self.opts.durability == Durability::Medium || self.opts.durability == Durability::High || self.buffer.len() >= 4096 {
+        // 8096 -> 8KB
+        // @TODO revise this implementation
+        if self.opts.durability == Durability::Medium || self.opts.durability == Durability::High || self.file.buffer().len() >= 8096 {
             self.flush();
         }
 
-        self.last_index = batch.indexes[batch.indexes.len() - 1];
+        self.last_index += batch.datas.len() as u64;
         // reset the batch for reuse
         batch.clear();
 
         Ok(())
     }
-
+    
+    // FirstIndex returns the index of the first entry in the log. Returns zero
+    // when log has no entries.
     pub fn firstindex(&self) -> Result<u64, Error> {
         if self.closed {
             return Err(Error::Closed);
@@ -443,14 +484,18 @@ impl Log {
 
         Ok(self.first_index)
     }
-
+    
+    // LastIndex returns the index of the last entry in the log. Returns zero when
+    // log has no entries.
     pub fn lastindex(&self) -> Result<u64, Error> {
         if self.closed {
             return Err(Error::Closed);
         }
         Ok(self.last_index)
     }
-
+    
+    // Read an entry from the log. This function reads an entry from disk and is
+    // optimized for sequential reads. Randomly accessing entries is slow.
     pub fn read(&mut self, index: u64) -> Result<Vec<u8>, Error> {
         if self.closed {
             return Err(Error::Closed);
@@ -470,7 +515,7 @@ impl Log {
             }
         }
 
-        let mut reader_index = match r {
+        let reader_index = match r {
             Some(r) => r,
             // Reader not found, open a new reader and return the entry at index
             None => return self.open_reader(index),
@@ -479,7 +524,7 @@ impl Log {
         // Read next entry from reader
         let sindex = self.readers[reader_index as usize].sindex;
         let nindex = self.readers[reader_index as usize].nindex;
-        // let mut reader = &mut self.readers[reader_index as usize].rd;
+
         loop {
             let entry = match self.read_entry_with_index(reader_index) {
                 Err(e) => {
@@ -487,9 +532,9 @@ impl Log {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
                             if sindex as usize == self.segments.len() - 1 {
                                 // At the ned of the last segment file
-                                if self.buffer.len() > 0 {
-                                    self.file.write_all(&self.buffer);
-                                    self.buffer = Vec::new();
+                                if self.file.buffer().len() > 0 {
+                                    self.file.flush().expect("Failed to write to file");
+                                    // self.buffer = Vec::new();
                                     continue;
                                 }
 
@@ -541,16 +586,17 @@ impl Log {
     fn open_reader(&mut self, index: u64) -> Result<Vec<u8>, Error> {
         let sindex = self.find_segment(index);
         let mut nindex = self.segments[sindex as usize].index;
-        let file = File::open(self.segments[sindex as usize].path.clone())?;
+        let file = File::open(&self.segments[sindex as usize].path)?;
         let mut buf_reader = BufReader::new(file);
 
         if sindex as usize == self.segments.len() - 1 {
-            if self.buffer.len() > 0 {
+            if self.file.buffer().len() > 0 {
                 // this means we are reading from the the last segment which
                 // has an in memory buffer, therefore flush the buffer
                 // before reading from file
-                self.file.write_all(&self.buffer).expect("OpenReader: failed to write");
-                self.buffer = Vec::new(); 
+                // self.file.write_all(&self.buffer).expect("OpenReader: failed to write");
+                self.file.flush().expect("OpenReader: failed to write");
+                // self.buffer = Vec::new(); 
             }
         }
 
@@ -607,13 +653,15 @@ impl Log {
             return Err(Error::OutOfRange);
         }
 
-        if self.buffer.len() > 0 {
-            self.file.write_all(&self.buffer).expect("should write to file");
-            self.buffer = Vec::new();
+        if self.file.buffer().len() > 0 {
+            // self.file.write_all(&self.buffer).expect("should write to file");
+            self.file.flush().expect("should write to file");
+            // self.buffer = Vec::new();
         }
 
         // close all readers
         // TODO check do I need readers array???
+        self.readers.drain(0..);
 
         if index == self.last_index {
             return Ok(())
@@ -626,7 +674,7 @@ impl Log {
 
         // Read all entries prior to entry at index
         let mut reader = BufReader::new(file);
-        let mut found = false;
+        let found;
         // let mut offset = 0;
         loop {
             let ridx = self.read_entry(&mut reader)?;
@@ -671,7 +719,7 @@ impl Log {
         let file_size = file.metadata()?.len();
         self.file = BufWriter::new(file);
         self.file_size = file_size as usize;
-        self.buffer = Vec::new();
+        // self.buffer = Vec::new();
         self.last_index = index;
 
         // move the write cursor to the end of 
@@ -690,21 +738,24 @@ impl Log {
             return Err(Error::OutOfRange);
         }
 
-        if self.buffer.len() > 0 {
-            self.file.write_all(&self.buffer).expect("should write to file");
-            self.buffer = Vec::new();
+        if self.file.buffer().len() > 0 {
+            // self.file.write_all(&self.buffer).expect("should write to file");
+            self.file.flush().expect("should write to file");
+            // self.buffer = Vec::new();
         }
 
         // close all readers
         // TODO check do I need readers array???
+        self.readers.drain(0..);
 
-        if index == self.last_index {
+        if index == self.first_index {
             return Ok(())
         }
 
         let sindex = self.find_segment(index);
         // Open file
-        let mut file = File::open(&self.segments[sindex as usize].path)?;
+        let file = File::open(&self.segments[sindex as usize].path)?;
+        // @TODO close file
         let mut reader = BufReader::new(file);
 
         if index > self.segments[sindex as usize].index {
@@ -712,7 +763,8 @@ impl Log {
             let found: bool;
             loop {
                 let ridx = self.read_entry(&mut reader)?;
-                if ridx.index == index + 1 {
+                if ridx.index == index - 1 {
+                    // @TODO Seeker check
                     found = true;
                     break;
                 }
@@ -722,6 +774,7 @@ impl Log {
                 return Err(Error::Corrupt);
             }
         }
+
 
         // Read all entries prior to entry at index
         let temp_filepath = self.path.join("TEMP");
@@ -752,7 +805,7 @@ impl Log {
 
             self.file = BufWriter::new(file);
             self.file_size = file_size as usize;
-            self.buffer = Vec::new();
+            // self.buffer = Vec::new();
         }
 
         self.first_index = index;

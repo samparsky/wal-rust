@@ -1,9 +1,9 @@
 [package]
-name = "wal-rust"
+name = "wal"
 version = "0.1.0"
 authors = ["samparsky <8148384+samparsky@users.noreply.github.com>"]
 edition = "2018"
-
+exclude = ["examples/"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

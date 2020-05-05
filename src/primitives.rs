@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::fs::File;
 use std::io::BufReader;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd)]
 pub enum Durability {
     Low,
     Medium,
@@ -37,7 +37,7 @@ pub struct Segment {
 
 #[derive(Debug)]
 pub struct Reader {
-    pub sindex:  u64,
-    pub nindex: u64,
+    pub sindex:  u64, // segment index
+    pub nindex: u64,  // next entry index
     pub rd: BufReader<File>,
 }
