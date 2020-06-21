@@ -1,6 +1,6 @@
 # wal-rust
 
-A simple and fast write ahead log for Rust.
+[WIP] A simple and fast write ahead log for Rust.
 
 ## Features
 
