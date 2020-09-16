@@ -169,8 +169,8 @@ fn read_entry_json(reader: &mut BufReader<File>, _log_format: &LogFormat) -> Res
         },
         _ => {},
     };
-    println!("buffer contents {}", buf);
-    println!("buffer contents len {}", buf.len());
+    // println!("buffer contents {}", buf);
+    // println!("buffer contents len {}", buf.len());
     
     if buf.len() == 0 || buf.len() == 1 {
         return Err(Error::File(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty file")));
@@ -180,13 +180,13 @@ fn read_entry_json(reader: &mut BufReader<File>, _log_format: &LogFormat) -> Res
         Ok(entry) => entry,
         Err(_e) =>  return Err(Error::Corrupt),
     };
-    println!("entry 2 {:?}", entry);
+    // println!("entry 2 {:?}", entry);
     return Ok(entry)
 }
 
 impl Log {
     pub fn open(dir: &str, opts: Option<&Options>) -> Result<Log, Error>{
-        println!("in testing ");
+        // println!("in testing ");
         if dir == ":memory:" {
             return Err(Error::InMemoryLog);
         }
@@ -202,9 +202,9 @@ impl Log {
         // let mut last_index = 0;
 
         // let mut file: File;
-        println!("start index {}", start_index);
-        println!("end index {}", end_index);
-        println!("segments {:?}", segments);
+        // println!("start index {}", start_index);
+        // println!("end index {}", end_index);
+        // println!("segments {:?}", segments);
 
         if segments.len() == 0 {
             let file_path = path_dir.join(&segment_name(1));
@@ -305,7 +305,7 @@ impl Log {
             }
         };
 
-        println!("after testing",);
+        // println!("after testing",);
 
         let mut writer = BufWriter::new(file);
         
@@ -387,7 +387,7 @@ impl Log {
         if self.opts.durability >= Durability::Medium || self.file.buffer().len() > *MAX_BUFFER_SIZE {
             self.flush();
         }
-        println!("index {}", index);
+        // println!("index {}", index);
         self.last_index = index;
 
         Ok(())
@@ -547,7 +547,6 @@ impl Log {
             // Reader not found, open a new reader and return the entry at index
             None => return self.open_reader(index),
         };
-        println!("checking found a reader");
         // Read next entry from reader
         let sindex = self.readers[reader_index as usize].sindex;
         let nindex = self.readers[reader_index as usize].nindex;
@@ -555,7 +554,6 @@ impl Log {
         loop {
             let entry = match self.read_entry_with_index(reader_index) {
                 Err(e) => {
-                    println!("{:?}", e);
                     if let Error::File(e) = e {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
                             if sindex as usize == self.segments.len() - 1 {
@@ -565,7 +563,7 @@ impl Log {
                                     // self.buffer = Vec::new();
                                     continue;
                                 }
-                                println!("in testing found");
+                                // println!("in testing found");
                                 self.readers.remove(reader_index as usize);
                                 return Err(Error::Corrupt);
                             }
@@ -579,8 +577,8 @@ impl Log {
                 Ok(e) => e.to_owned(),
             };
 
-            println!("{:?}", entry);
-            println!("index {}", index);
+            // println!("{:?}", entry);
+            // println!("index {}", index);
 
             if entry.index != index {
                 self.readers.remove(reader_index as usize);
@@ -825,7 +823,7 @@ impl Log {
         drop(temp_file);
 
         let end_filename = self.path.join(segment_name(index));
-        println!("{:?}", end_filename);
+        // println!("{:?}", end_filename);
 
         for i in 0..sindex+1 {
             fs::remove_file(&self.segments[i as usize].path).expect("should remove file");
@@ -871,7 +869,7 @@ mod test {
         //     fs::remove_dir_all(&base_path).expect("should remove dir");
         // }
 
-        println!("after path");
+        // println!("after path");
 
         // Durability::Low
         let path = format!("{}{}", base_path, "/json");
@@ -894,7 +892,7 @@ mod test {
 
     
     fn test_log(path: &str, mut N: u64, opts: Option<&Options>) {
-        println!("in it");
+        // println!("in it");
         // let mut N: u64 = 100;
         // unimplemented!();
         // let path = "testlog/log";
@@ -918,7 +916,7 @@ mod test {
             
             // Write - append next item
             log.write(i, data_str(i)).expect("Write: should append item successfully");
-            println!("i {}", i);
+            // println!("i {}", i);
             // Write - get next item
             let data = log.read(i).expect("WriteN: should read item");
 
@@ -1122,7 +1120,7 @@ mod test {
         //@TODO TruncateBack -- should fail, out of range
 
         // TruncateBack -- Remove no entries
-        println!("N = {}", N);
+        // println!("N = {}", N);
         match log.truncate_back(N) {
             Ok(()) => {},
             Err(e) => panic!(format!("TruncateBackN: {}", e))
